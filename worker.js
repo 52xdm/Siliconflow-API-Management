@@ -284,6 +284,18 @@ async function handleAdminAPI(request, endpoint) {
         return new Response(JSON.stringify({ success: true }), {
           headers: { "Content-Type": "application/json" }
         });
+      } if (endpoint === "delete-keys") {
+        // 删除密钥
+        if (!data.keys) {
+          return new Response(JSON.stringify({ success: false, message: "Key is required" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        await deleteKeys(data.keys);
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { "Content-Type": "application/json" }
+        });
       } else if (endpoint === "update-config") {
         // 更新配置
         await updateConfiguration(data);
@@ -378,6 +390,61 @@ async function handleAdminAPI(request, endpoint) {
             headers: { "Content-Type": "application/json" }
           });
         }
+      } else if (endpoint === "update-key-balance-bulk") {
+        if (!data.keys) {
+          return new Response(JSON.stringify({ success: false, message: "密钥不能为空" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // 获取所有 keys
+        const allKeys = await getAllKeys();
+        const checkKeys = allKeys.filter(k => data.keys.includes(k.key));
+
+        if (!checkKeys) {
+          return new Response(JSON.stringify({ success: false, message: "密钥不存在" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+
+        // 更新单个密钥的余额
+        try {
+          let successCount = 0, failCount = 0;
+          await Promise.all(checkKeys.map(async (k) => {
+            const result = await checkKeyValidity(k.key);
+            const now = new Date();
+            const beijingTime = new Date(now.getTime()).toISOString();
+            // 在这里处理 result
+            // 更新密钥状态
+            if (result.isValid) {
+              k.balance = result.balance;
+              k.lastUpdated = new Date().toISOString();
+              k.lastError = null; // 清除之前的错误
+              successCount++
+            } else {
+              k.balance = 0;
+              k.lastUpdated = new Date().toISOString();
+              k.lastError = result.message;
+              failCount++;
+            }
+          }));
+
+          await SILICONFLOW_KEY.put("keys", JSON.stringify(allKeys));
+
+          return new Response(JSON.stringify({ success: true, successCount, failCount, data: checkKeys }), {
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (error) {
+          return new Response(JSON.stringify({
+            success: false,
+            message: "检测余额失败: " + error.message
+          }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
       }
     } else if (request.method === "DELETE") {
       if (endpoint.startsWith("keys/")) {
@@ -453,14 +520,14 @@ async function handleAPIProxy(request, path) {
   // 负载均衡 - 随机选择一个密钥
   const randomIndex = Math.floor(Math.random() * validKeys.length);
   const selectedKey = validKeys[randomIndex].key;
-  
+
   // 克隆请求并修改头信息
   const newHeaders = new Headers(request.headers);
   newHeaders.set("Authorization", `Bearer ${selectedKey}`);
-  
+
   // 移除host头以避免冲突
   newHeaders.delete("host");
-  
+
   // 创建新请求
   const newRequest = new Request(`https://api.siliconflow.cn${path}`, {
     method: request.method,
@@ -468,25 +535,25 @@ async function handleAPIProxy(request, path) {
     body: request.body,
     redirect: 'follow'
   });
-  
+
   // 转发请求
   const response = await fetch(newRequest);
-  
+
   // 创建一个新的响应用于流式传输（如果需要）
   const newResponse = new Response(response.body, response);
-  
+
   // 添加完整的CORS头
   newResponse.headers.set("Access-Control-Allow-Origin", "*");
   newResponse.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   newResponse.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
   newResponse.headers.set("Access-Control-Allow-Credentials", "true");
   newResponse.headers.set("Access-Control-Max-Age", "86400");
-  
+
   // 禁用缓存以支持流式传输
   newResponse.headers.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   newResponse.headers.set("Pragma", "no-cache");
   newResponse.headers.set("Expires", "0");
-  
+
   return newResponse;
 }
 
@@ -506,7 +573,7 @@ async function addKey(key, balance = 0) {
   // 检查密钥是否已存在
   const keys = await getAllKeys();
   const existingKeyIndex = keys.findIndex(k => k.key === key);
-  
+
   if (existingKeyIndex !== -1) {
     // 更新现有密钥
     keys[existingKeyIndex].balance = balance;
@@ -514,32 +581,38 @@ async function addKey(key, balance = 0) {
     // 添加新密钥
     keys.push({ key, balance, added: new Date().toISOString() });
   }
-  
+
   await SILICONFLOW_KEY.put("keys", JSON.stringify(keys));
 }
 
 // 新增批量添加函数
 async function addKeys(keys, balance = 0) {
-// 检查密钥是否已存在
-const allKeys = await getAllKeys();
+  // 检查密钥是否已存在
+  const allKeys = await getAllKeys();
 
-keys.forEach(key => {
-  const existingKeyIndex = allKeys.findIndex(k => k.key === key);
+  keys.forEach(key => {
+    const existingKeyIndex = allKeys.findIndex(k => k.key === key);
 
-  if (existingKeyIndex !== -1) {
-    // 更新现有密钥
-    allKeys[existingKeyIndex].balance = balance;
-  } else {
-    // 添加新密钥
-    allKeys.push({ key, balance, added: new Date().toISOString() });
-  }
-});
-await SILICONFLOW_KEY.put("keys", JSON.stringify(allKeys));
+    if (existingKeyIndex !== -1) {
+      // 更新现有密钥
+      allKeys[existingKeyIndex].balance = balance;
+    } else {
+      // 添加新密钥
+      allKeys.push({ key, balance, added: new Date().toISOString() });
+    }
+  })
+  await SILICONFLOW_KEY.put("keys", JSON.stringify(allKeys));
 }
 
 async function deleteKey(key) {
   const keys = await getAllKeys();
   const updatedKeys = keys.filter(k => k.key !== key);
+  await SILICONFLOW_KEY.put("keys", JSON.stringify(updatedKeys));
+}
+
+async function deleteKeys(keys) {
+  const allKeys = await getAllKeys();
+  const updatedKeys = allKeys.filter(k => !keys.includes(k.key));
   await SILICONFLOW_KEY.put("keys", JSON.stringify(updatedKeys));
 }
 
@@ -585,42 +658,42 @@ async function checkKeyValidity(key) {
         stream: false
       })
     });
-    
+
     if (!validationResponse.ok) {
       const errorData = await validationResponse.json().catch(() => null);
-      const errorMessage = errorData && errorData.error && errorData.error.message 
-        ? errorData.error.message 
+      const errorMessage = errorData && errorData.error && errorData.error.message
+        ? errorData.error.message
         : "密钥验证失败";
-        
+
       return {
         isValid: false,
         balance: 0,
         message: errorMessage
       };
     }
-    
+
     // 2. 查询余额
     const balanceResponse = await fetch("https://api.siliconflow.cn/v1/user/info", {
       method: "GET",
       headers: { "Authorization": `Bearer ${key}` }
     });
-    
+
     if (!balanceResponse.ok) {
       const errorData = await balanceResponse.json().catch(() => null);
-      const errorMessage = errorData && errorData.error && errorData.error.message 
-        ? errorData.error.message 
+      const errorMessage = errorData && errorData.error && errorData.error.message
+        ? errorData.error.message
         : "余额查询失败";
-        
+
       return {
         isValid: false,
         balance: 0,
         message: errorMessage
       };
     }
-    
+
     const data = await balanceResponse.json();
     const balance = data.data && data.data.totalBalance || 0;
-    
+
     return {
       isValid: true,
       balance: balance,
@@ -5898,6 +5971,249 @@ const adminHtmlContent = `
         return \`\${hours}小时\${minutes}分\${remainingSeconds}秒\`;
       }
     }
+    
+    // 批量处理批量检测密钥余额
+    async function newBatchCheckSelectedKeys() {
+      
+      const processedKeysSet = new Set(); // 用于跟踪已经处理过的密钥
+
+      // 如果没有选择任何密钥，直接返回
+      if (selectedKeys.size === 0) {
+        showToast('请选择至少一个API Key', true);
+        return;
+      }
+
+      // 获取配置
+      const intervalType = document.getElementById('interval-type').value;
+      const minInterval = parseInt(document.getElementById('min-interval').value) || 500;
+      const maxInterval = parseInt(document.getElementById('max-interval').value) || 1500;
+      const retryCount = parseInt(document.getElementById('retry-count').value) || 1;
+      const retryInterval = parseInt(document.getElementById('retry-interval').value) || 2000;
+
+      try {
+        // 准备进度显示
+        showProgress("批量检测密钥余额");
+        
+        // 将选中的密钥转换为数组
+        const keysToCheck = Array.from(selectedKeys);
+        const total = keysToCheck.length;
+        
+        let processed = 0;
+        let successful = 0;
+        let failed = 0;
+        let startTime = Date.now();
+        
+        // 创建任务队列
+        const queue = [...keysToCheck];
+        const results = []; // 存储结果
+        
+        // 更新进度显示
+        function updateProgressDisplay() {
+          const percentComplete = Math.floor((processed / total) * 100);
+          const elapsed = Date.now() - startTime;
+          const speed = processed > 0 ? elapsed / processed : 0; // 每个key平均处理时间(ms)
+          const remaining = (total - processed) * speed; // 估计剩余时间(ms)
+          
+          // 更新进度条
+          updateProgress(processed, total, successful);
+
+          // 格式化剩余时间，精确到秒
+          const remainingText = formatTime(remaining);
+          const elapsedText = formatTime(elapsed);
+
+          // 格式化速度
+          const speedText = (speed / 1000).toFixed(2) + '秒/项';
+  
+          // 更新详细信息
+          document.getElementById('progress-speed').textContent = speedText;
+          document.getElementById('progress-eta').textContent = remainingText;
+          document.getElementById('progress-elapsed').textContent = elapsedText;
+  
+          // 更新表格行状态
+          results.forEach(result => {
+            const row = document.querySelector(\`tr[data-key="\${result.key}"]\`);
+            if (row) {
+              // 更新余额
+              row.querySelector('td:nth-child(4)').textContent = result.balance || 0;
+              
+              // 更新时间
+              const updateTime = result.lastUpdated ? new Date(result.lastUpdated).toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false // 使用24小时制
+              }) : new Date().toLocaleString('zh-CN', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false // 使用24小时制
+              });
+
+              row.querySelector('td:nth-child(5)').innerHTML = \`<small>更新于 \${updateTime}</small>\`;
+            
+
+              // 更新状态 - 判断是否成功且余额大于0
+              if (!result.lastError && result.balance > 0) {
+                row.querySelector('td:nth-child(7)').innerHTML = '<span class="admin-normal-status">正常</span>';
+              } else {
+                row.querySelector('td:nth-child(7)').innerHTML = \`
+                  <span class="tooltip">
+                    <span style="color: #e74c3c;">错误</span>
+                    <span class="tooltip-text">\${result.message || '未知错误'}</span>
+                  </span>
+                \`;
+              }
+            }
+          });
+        }
+
+        // 添加时间格式化函数
+        function formatTime(milliseconds) {
+          if (isNaN(milliseconds) || milliseconds <= 0) {
+            return "计算中...";
+          }
+          
+          const seconds = Math.floor(milliseconds / 1000);
+          
+          if (seconds < 60) {
+            return \`\${seconds}秒\`;
+          } else if (seconds < 3600) {
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = seconds % 60;
+            return \`\${minutes}分\${remainingSeconds}秒\`;
+          } else {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const remainingSeconds = seconds % 60;
+            return \`\${hours}小时\${minutes}分\${remainingSeconds}秒\`;
+          }
+        }
+        
+        // 处理单个键
+        async function processKeys(keys, attempts = 0) {
+          try {
+            const validKeys = [];
+            // 如果密钥已处理，直接返回，不重复计算进度
+            keys.forEach(k => {
+              if (!processedKeysSet.has(k)) {
+                validKeys.push(k);
+              }
+            });
+
+            if (!validKeys) {
+                return;
+            }
+
+            // 标记该密钥已被处理
+            validKeys.forEach(k => processedKeysSet.add(k));
+            
+            const response = await fetch('/admin/api/update-key-balance-bulk', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ "keys": validKeys })
+            });
+            
+            if (!response.ok) throw new Error('检测余额失败');
+            
+            // 保存结果
+            const result = await response.json();
+            results.push(result.data);
+
+            processed+=keys.length;
+            successful+=result.successCount;
+            failed+=result.failCount;
+            
+            updateProgressDisplay();
+            
+            return result;
+          } catch (error) {
+            console.error(\`检测密钥\${keys}时出错:\`, error);
+            
+            // 重试逻辑
+            if (attempts < retryCount) {
+              console.log(\`重试密钥\${keys}, 尝试次数: \${attempts + 1}/\${retryCount}\`);
+              await new Promise(resolve => setTimeout(resolve, retryInterval));
+              return processKeys(keys, attempts + 1);
+            }
+            
+            // 重试失败，标记为错误
+            const result = keys.map(key => ({
+              key: key,
+              success: false,
+              balance: 0,
+              message: \`检测失败: \${error.message}\`
+            }));
+            results.push(result);
+
+            // 即使出错也要标记为已处理，避免重复计算
+            keys.forEach(k => {
+                if (!processedKeysSet.has(k)) {
+                  processedKeysSet.add(k);
+                }
+            })
+            processed+=keys.length; // 仍然计入已处理数量
+            failed+=keys.length;
+              
+            updateProgressDisplay();
+            
+            return { success: false, message: error.message };
+          }
+        }
+
+        // 分批处理所有密钥 TODO 使用配置
+        const chunkSize = 5;
+        for (let i = 0; i < keysToCheck.length; i+=chunkSize) {
+          // 检查是否收到停止信号
+          if (isBatchProcessingStopped) {
+            hideProgress();
+            showToast(\`批量检测已停止！已完成: \${processed}/\${total}\`);
+            return;
+          }
+          
+          // 获取请求延迟时间
+          let delay;
+          if (i > 0) { // 第一个请求不需要延迟
+            const intervalType = document.getElementById('interval-type').value;
+            const effectiveMinInterval = Math.max(500, parseInt(document.getElementById('min-interval').value) || 500);
+            const maxInterval = parseInt(document.getElementById('max-interval').value) || 1500;
+            
+            // 根据间隔类型计算延迟
+            if (intervalType === 'fixed') {
+              const fixedIntervalSeconds = parseFloat(document.getElementById('concurrency').value) || 1;
+              delay = Math.max(500, Math.round(fixedIntervalSeconds * 1000));
+            } else {
+              delay = Math.floor(Math.random() * (maxInterval - effectiveMinInterval + 1)) + effectiveMinInterval;
+            }
+            
+            // 在处理下一个密钥前添加延迟
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+          
+          const chunk = keysToCheck.slice(i, i + chunkSize);
+          // 处理当前密钥
+          await processKeys(chunk);
+        }
+
+        
+        
+        // 处理完成
+        setTimeout(() => {
+          hideProgress();
+          showToast(\`批量检测完成！成功: \${successful}, 失败: \${failed}\`);
+        }, 1000);
+        
+      } catch (error) {
+        hideProgress();
+        console.error('批量检测失败:', error);
+        showToast(\`批量检测失败: \${error.message}\`, true);
+      }
+    }
 
     // 批量删除选中的密钥
     function batchDeleteSelectedKeys() {
@@ -5916,59 +6232,27 @@ const adminHtmlContent = `
           const total = keysToDelete.length;
           let processed = 0;
           let successful = 0;
-          // 添加开始时间记录
-          let startTime = Date.now();
           
-          for (const key of keysToDelete) {
-            // 添加检查是否收到停止信号
-            if (isBatchProcessingStopped) {
-              hideProgress();
-              showToast(\`批量删除已停止！已完成: \${processed}/\${total}\`);
-              loadAllKeys();
-              return;
+          try {
+            const response = await fetch('/admin/api/delete-keys', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ "keys": keysToDelete })
+            });
+            
+            if (!response.ok) throw new Error('删除失败');
+            
+            const result = await response.json();
+            if (result.success) {
+              successful+=total;
+              selectedKeys.delete(keysToDelete); // 从选中集合中移除
             }
             
-            try {
-              const response = await fetch('/admin/api/delete-key', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key })
-              });
-              
-              if (!response.ok) throw new Error('删除失败');
-              
-              const result = await response.json();
-              if (result.success) {
-                successful++;
-                selectedKeys.delete(key); // 从选中集合中移除
-              }
-              
-            } catch (error) {
-              console.error(\`删除密钥 \${key} 失败:\`, error);
-            } finally {
-              processed++;
-              
-              // 计算时间指标
-              const elapsed = Date.now() - startTime;
-              const speed = processed > 0 ? elapsed / processed : 0; // 每个key平均处理时间(ms)
-              const remaining = (total - processed) * speed; // 估计剩余时间(ms)
-              
-              // 格式化时间文本
-              const remainingText = formatTime(remaining);
-              const elapsedText = formatTime(elapsed);
-              const speedText = (speed / 1000).toFixed(2) + '秒/项';
-              
-              // 更新更详细的进度信息
-              updateProgress(processed, total, successful);
-              
-              // 更新详细信息
-              document.getElementById('progress-speed').textContent = speedText;
-              document.getElementById('progress-eta').textContent = remainingText;
-              document.getElementById('progress-elapsed').textContent = elapsedText;
-            }
-            
-            // 添加短暂延迟避免请求过快
-            await new Promise(resolve => setTimeout(resolve, 100));
+          } catch (error) {
+            console.error(\`删除密钥失败:\`, error);
+          } finally {
+            processed+=total;
+            updateProgress(processed, total, successful);
           }
           
           // 重新加载数据
@@ -6472,7 +6756,7 @@ const adminHtmlContent = `
           updateSelectionStatus();
           
           // 调用批量检测功能
-          await batchCheckSelectedKeys();
+          await newBatchCheckSelectedKeys();
           
           // 更新完成后刷新仪表盘数据
           setTimeout(loadDashboard, 500);
@@ -6615,7 +6899,8 @@ const adminHtmlContent = `
           const keys = result.data;
           const invalidKeys = keys.filter(k => k.balance <= 0 || k.lastError).map(k => k.key);
           
-          if (invalidKeys.length === 0) {
+          let total = invalidKeys.length;
+          if (total === 0) {
             showToast('没有找到无效密钥');
             return;
           }
@@ -6627,27 +6912,22 @@ const adminHtmlContent = `
           let processed = 0;
           let successful = 0;
           
-          for (const key of invalidKeys) {
-            try {
-              const deleteResponse = await fetch('/admin/api/delete-key', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key })
-              });
-              
-              if (deleteResponse.ok) {
-                const deleteResult = await deleteResponse.json();
-                if (deleteResult.success) successful++;
-              }
-            } catch (e) {
-              console.error(\`删除密钥 \${key} 失败:\`, e);
-            } finally {
-              processed++;
-              updateProgress(processed, invalidKeys.length, successful);
-              
-              // 添加短暂延迟避免请求过快
-              await new Promise(resolve => setTimeout(resolve, 100));
+          try {
+            const deleteResponse = await fetch('/admin/api/delete-keys', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ "keys": invalidKeys })
+            });
+            
+            if (deleteResponse.ok) {
+              const deleteResult = await deleteResponse.json();
+              if (deleteResult.success) successful+=total;
             }
+          } catch (e) {
+            console.error(\`删除密钥失败:\`, e);
+          } finally {
+            processed+=total;
+            updateProgress(processed, invalidKeys.length, successful);
           }
           
           // 完成后重新加载数据
@@ -6856,7 +7136,7 @@ const adminHtmlContent = `
       // 批量检测按钮
       document.getElementById('check-selected-keys').addEventListener('click', async () => {
         try {
-          await batchCheckSelectedKeys();
+          await newBatchCheckSelectedKeys();
         } catch (error) {
           console.error("批量检测出错:", error);
         }
